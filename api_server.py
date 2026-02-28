@@ -615,6 +615,23 @@ def _job_urls(request: Request, job_id: str) -> tuple[str, str, str]:
     return status_url, html_url, logs_url
 
 
+def _read_result_html(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        LOGGER.warning("html decode warning path=%s (retry with ignore)", path)
+        try:
+            return path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            LOGGER.exception("failed reading html path=%s", path)
+            return None
+    except Exception:
+        LOGGER.exception("failed reading html path=%s", path)
+        return None
+
+
 def _build_job_create_response(payload: MeetingRunRequest, request: Request) -> JobCreateResponse:
     if not payload.segments:
         raise HTTPException(status_code=400, detail="segments is required and cannot be empty")
@@ -933,15 +950,20 @@ def get_job_result(job_id: str, request: Request) -> JSONResponse:
     if rec is None:
         raise HTTPException(status_code=404, detail="job not found")
     status_url, html_url, logs_url = _job_urls(request, job_id)
+    html_path = Path(rec.html_path)
+    html_ready = rec.status == "succeeded" and html_path.exists()
+    minutes_html = _read_result_html(html_path) if html_ready else None
     payload: dict[str, Any] = {
         "job_id": rec.job_id,
         "status": rec.status,
         "status_url": status_url,
         "html_url": html_url,
         "logs_url": logs_url,
-        "html_ready": rec.status == "succeeded" and Path(rec.html_path).exists(),
+        "html_ready": html_ready,
         "error": rec.error,
         "artifact_dir": rec.artifact_dir,
         "runtime_log_path": rec.runtime_log_path,
     }
+    if isinstance(minutes_html, str):
+        payload["minutes_html"] = minutes_html
     return JSONResponse(payload)

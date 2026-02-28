@@ -167,7 +167,7 @@ curl -X POST http://127.0.0.1:8000/generate_react \
 - `GET /jobs/{job_id}` ดูสถานะ (`queued/running/succeeded/failed`)
 - `GET /jobs/{job_id}/logs` ดู log run
 - `GET /jobs/{job_id}/html` ดาวน์โหลดผล HTML
-- `GET /jobs/{job_id}/result` ดูสรุปสถานะพร้อม URL
+- `GET /jobs/{job_id}/result` ดูสรุปสถานะพร้อม URL และ (เมื่อพร้อม) แนบ HTML ใน key `minutes_html`
 
 Output ของแต่ละ job จะอยู่ใน `output/api_jobs/<job_id>/`
 

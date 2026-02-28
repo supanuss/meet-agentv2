@@ -1,1 +1,1 @@
-docker buildx build --platform linux/amd64 -t l3ankky/meet-sum-api:0.1 --push .
+docker buildx build --platform linux/amd64 -t l3ankky/meet-sum-api:0.22 --push .

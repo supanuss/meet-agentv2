@@ -725,10 +725,15 @@ class MeetingWorkflow:
             AGENT1_SYS,
             user,
             json_mode=True,
-            required_keys=["meeting_meta", "timeline", "slides"],
+            # Transcript-only path primarily needs timeline; meta/slides can be filled with defaults.
+            required_keys=["timeline"],
             tag=tag,
         )
         assert isinstance(out, dict)
+        if not isinstance(out.get("meeting_meta"), dict):
+            out["meeting_meta"] = {}
+        if not isinstance(out.get("slides"), list):
+            out["slides"] = []
         has_text = any(str(seg.get("text", "") or "").strip() for seg in seg_chunk)
         if has_text and not isinstance(out.get("timeline"), list):
             raise PipelineError(f"{tag}: timeline is not a list")
