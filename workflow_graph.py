@@ -334,6 +334,77 @@ class MeetingWorkflow:
         )
         return {"extracted_topics": extracted, "topic_flow": topic_flow}
 
+    def _agent3a_fallback_from_hints(
+        self,
+        agenda_lines: list[str],
+        semantic_hints: list[dict[str, Any]],
+        topics: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        topic_by_id: dict[str, dict[str, Any]] = {}
+        for topic in topics:
+            if not isinstance(topic, dict):
+                continue
+            tid = str(topic.get("id", "") or "").strip()
+            if tid:
+                topic_by_id[tid] = topic
+
+        agenda_mapping: list[dict[str, Any]] = []
+        discussed = 0
+        for idx, line in enumerate(agenda_lines, start=1):
+            hint = semantic_hints[idx - 1] if idx - 1 < len(semantic_hints) else {}
+            best_topic_id = str(hint.get("semantic_best_topic", "") or "").strip()
+            topic = topic_by_id.get(best_topic_id)
+
+            agenda_number = str(idx)
+            agenda_title = str(line or "").strip()
+            m = re.match(r"^\s*(\d+(?:\.\d+)*)[\).:\-]?\s*(.*)$", agenda_title)
+            if m:
+                agenda_number = m.group(1).strip() or agenda_number
+                parsed_title = m.group(2).strip()
+                if parsed_title:
+                    agenda_title = parsed_title
+
+            department = ""
+            dep_match = re.search(r"(ฝ่าย[^\-\|:]{2,40})", agenda_title)
+            if dep_match:
+                department = dep_match.group(1).strip()
+
+            mapped_topics: list[str] = []
+            tr = {"start": "00:00:00", "end": "00:00:00"}
+            key_speaker = ""
+            if topic:
+                mapped_topics = [best_topic_id]
+                tr = {
+                    "start": str(topic.get("start_timestamp", "00:00:00") or "00:00:00"),
+                    "end": str(topic.get("end_timestamp", "00:00:00") or "00:00:00"),
+                }
+                speakers = topic.get("key_speakers", [])
+                if isinstance(speakers, list) and speakers:
+                    key_speaker = str(speakers[0] or "")
+                discussed += 1
+
+            agenda_mapping.append(
+                {
+                    "agenda_number": agenda_number,
+                    "agenda_title": agenda_title,
+                    "agenda_department": department,
+                    "status": "discussed" if mapped_topics else "not_discussed",
+                    "mapped_topics": mapped_topics,
+                    "time_range": tr,
+                    "key_speaker": key_speaker,
+                }
+            )
+
+        total = len(agenda_mapping)
+        return {
+            "agenda_mapping": agenda_mapping,
+            "coverage_stats": {
+                "total": total,
+                "discussed": discussed,
+                "not_discussed": max(0, total - discussed),
+            },
+        }
+
     def _coerce_time_to_hms(self, value: Any) -> str | None:
         if value is None:
             return None
@@ -675,15 +746,31 @@ class MeetingWorkflow:
             AGENT1_SYS,
             user,
             json_mode=True,
-            required_keys=["meeting_meta", "timeline", "slides"],
+            # Validate/repair timeline in-code to avoid hard-fail on missing key.
+            required_keys=[],
             tag=tag,
         )
         assert isinstance(out, dict)
+        if not isinstance(out.get("meeting_meta"), dict):
+            out["meeting_meta"] = {}
+        if not isinstance(out.get("slides"), list):
+            out["slides"] = []
         has_text = any(str(seg.get("text", "") or "").strip() for seg in seg_chunk)
-        if has_text and not isinstance(out.get("timeline"), list):
-            raise PipelineError(f"{tag}: timeline is not a list")
-        if has_text and not out.get("timeline"):
-            raise PipelineError(f"{tag}: empty timeline from transcript chunk")
+        if not isinstance(out.get("timeline"), list) or (has_text and not out.get("timeline")):
+            repaired = self._agent1_chunk_fallback(seg_chunk, ocr_subset)
+            # Keep useful meta/slides from LLM output when present.
+            llm_meta = out.get("meeting_meta", {})
+            if isinstance(llm_meta, dict) and llm_meta:
+                base_meta = repaired.get("meeting_meta", {})
+                if not isinstance(base_meta, dict):
+                    base_meta = {}
+                merged_meta = dict(base_meta)
+                merged_meta.update({k: v for k, v in llm_meta.items() if v not in ("", [], None)})
+                repaired["meeting_meta"] = merged_meta
+            llm_slides = out.get("slides", [])
+            if isinstance(llm_slides, list) and llm_slides:
+                repaired["slides"] = llm_slides
+            return repaired
         return out
 
     def _agent1_call_llm_ocr_only(
@@ -703,10 +790,17 @@ class MeetingWorkflow:
             AGENT1_SYS,
             user,
             json_mode=True,
-            required_keys=["meeting_meta", "timeline", "slides"],
+            # OCR-only path uses slides/meta opportunistically; avoid hard-fail on partial JSON.
+            required_keys=[],
             tag=tag,
         )
         assert isinstance(out, dict)
+        if not isinstance(out.get("meeting_meta"), dict):
+            out["meeting_meta"] = {}
+        if not isinstance(out.get("timeline"), list):
+            out["timeline"] = []
+        if not isinstance(out.get("slides"), list):
+            out["slides"] = []
         return out
 
     def _agent1_call_llm_transcript_only(
@@ -726,7 +820,7 @@ class MeetingWorkflow:
             user,
             json_mode=True,
             # Transcript-only path primarily needs timeline; meta/slides can be filled with defaults.
-            required_keys=["timeline"],
+            required_keys=[],
             tag=tag,
         )
         assert isinstance(out, dict)
@@ -735,10 +829,20 @@ class MeetingWorkflow:
         if not isinstance(out.get("slides"), list):
             out["slides"] = []
         has_text = any(str(seg.get("text", "") or "").strip() for seg in seg_chunk)
-        if has_text and not isinstance(out.get("timeline"), list):
-            raise PipelineError(f"{tag}: timeline is not a list")
-        if has_text and not out.get("timeline"):
-            raise PipelineError(f"{tag}: empty timeline from transcript chunk")
+        if not isinstance(out.get("timeline"), list) or (has_text and not out.get("timeline")):
+            repaired = self._agent1_chunk_fallback(seg_chunk, [])
+            llm_meta = out.get("meeting_meta", {})
+            if isinstance(llm_meta, dict) and llm_meta:
+                base_meta = repaired.get("meeting_meta", {})
+                if not isinstance(base_meta, dict):
+                    base_meta = {}
+                merged_meta = dict(base_meta)
+                merged_meta.update({k: v for k, v in llm_meta.items() if v not in ("", [], None)})
+                repaired["meeting_meta"] = merged_meta
+            llm_slides = out.get("slides", [])
+            if isinstance(llm_slides, list) and llm_slides:
+                repaired["slides"] = llm_slides
+            return repaired
         return out
 
     def _agent1_subchunk_recover(
@@ -940,6 +1044,75 @@ class MeetingWorkflow:
                     seen[key].add(sig)
                     out[key].append(item)
         return out
+
+    def _empty_agent2_entities(self) -> dict[str, list[dict[str, Any]]]:
+        return {
+            "people": [],
+            "projects": [],
+            "equipment": [],
+            "financials": [],
+            "issues": [],
+            "decisions": [],
+            "action_items": [],
+        }
+
+    def _agent2_chunk_fallback(
+        self,
+        tl_chunk: list[dict[str, Any]],
+        slides_subset: list[dict[str, Any]],
+        chunk_idx: int,
+    ) -> dict[str, Any]:
+        if not tl_chunk:
+            return {"entities": self._empty_agent2_entities(), "topics": []}
+
+        start_sec = int(float(tl_chunk[0].get("timestamp_sec", 0) or 0))
+        end_sec = int(float(tl_chunk[-1].get("timestamp_sec", start_sec) or start_sec))
+        if end_sec < start_sec:
+            end_sec = start_sec
+
+        speakers = Counter(str(r.get("speaker", "UNKNOWN") or "UNKNOWN") for r in tl_chunk if isinstance(r, dict))
+        key_speakers = [name for name, _ in speakers.most_common(3)]
+
+        summary_points: list[str] = []
+        for row in tl_chunk:
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("text", "") or "").strip()
+            if not text:
+                continue
+            trimmed = text[:180]
+            if trimmed in summary_points:
+                continue
+            summary_points.append(trimmed)
+            if len(summary_points) >= 4:
+                break
+
+        slide_timestamps: list[str] = []
+        for slide in slides_subset:
+            if not isinstance(slide, dict):
+                continue
+            ts = str(slide.get("timestamp_hms", "") or "")
+            if not ts or ts in slide_timestamps:
+                continue
+            slide_timestamps.append(ts)
+            if len(slide_timestamps) >= 8:
+                break
+
+        topic = {
+            "id": f"F{chunk_idx:03d}",
+            "name": f"หัวข้อช่วง {sec_to_hms(start_sec)} - {sec_to_hms(end_sec)}",
+            "department": "",
+            "start_timestamp": sec_to_hms(start_sec),
+            "end_timestamp": sec_to_hms(end_sec),
+            "duration_minutes": max((end_sec - start_sec) // 60, 1),
+            "key_speakers": key_speakers,
+            "slide_timestamps": slide_timestamps,
+            "summary_points": summary_points,
+            "issues": [],
+            "decisions": [],
+            "action_items": [],
+        }
+        return {"entities": self._empty_agent2_entities(), "topics": [topic]}
 
     def _collect_topics_from_partials(self, partial_kgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         topics: list[dict[str, Any]] = []
@@ -1589,7 +1762,18 @@ class MeetingWorkflow:
             artifact_dir = state.get("artifact_dir")
             if topics:
                 topic_texts = [build_topic_text(t) for t in topics if isinstance(t, dict)]
-                topic_vecs = self.llm.embed(topic_texts) if topic_texts else []
+                topic_vecs: list[list[float]] = []
+                if topic_texts:
+                    try:
+                        topic_vecs = self.llm.embed(topic_texts)
+                    except Exception as exc:
+                        self._append_log(
+                            run_meta,
+                            artifact_dir,
+                            "Agent2 embedding failed",
+                            error=str(exc),
+                            action="continue_without_vectors",
+                        )
                 for i, topic in enumerate(topics):
                     if isinstance(topic, dict):
                         topic["_vec"] = topic_vecs[i] if i < len(topic_vecs) else []
@@ -1669,16 +1853,58 @@ class MeetingWorkflow:
                 AGENT2_SYS,
                 user,
                 json_mode=True,
-                required_keys=["entities", "topics"],
+                # Allow partial outputs and sanitize in-code to avoid losing whole chunks.
+                required_keys=["entities"],
                 tag=f"agent2_map_chunk_{idx}",
             )
             assert isinstance(out, dict)
+            entities = out.get("entities", {})
+            if not isinstance(entities, dict):
+                entities = {}
+            for key in ["people", "projects", "equipment", "financials", "issues", "decisions", "action_items"]:
+                if not isinstance(entities.get(key), list):
+                    entities[key] = []
+            out["entities"] = entities
+
+            raw_topics = out.get("topics", [])
+            if not isinstance(raw_topics, list):
+                raw_topics = []
+            kept_topics: list[dict[str, Any]] = []
+            for raw in raw_topics:
+                if not isinstance(raw, dict):
+                    continue
+                has_signal = (
+                    bool(str(raw.get("name", "") or "").strip())
+                    or bool(str(raw.get("title", "") or "").strip())
+                    or bool(str(raw.get("start_timestamp", "") or "").strip())
+                    or bool(str(raw.get("end_timestamp", "") or "").strip())
+                    or bool([x for x in (raw.get("summary_points", []) if isinstance(raw.get("summary_points"), list) else []) if str(x).strip()])
+                    or bool([x for x in (raw.get("decisions", []) if isinstance(raw.get("decisions"), list) else []) if str(x).strip()])
+                    or bool([x for x in (raw.get("action_items", []) if isinstance(raw.get("action_items"), list) else []) if str(x).strip()])
+                )
+                if not has_signal:
+                    continue
+                norm = self._normalize_topic(raw, len(kept_topics) + 1)
+                if norm:
+                    kept_topics.append(norm)
+            out["topics"] = kept_topics
             return idx, out
 
         workers = self._effective_workers(len(chunk_inputs))
         if workers == 1:
             for idx, tl_chunk, slides_subset in chunk_inputs:
-                _, out = run_one_chunk((idx, tl_chunk, slides_subset))
+                try:
+                    _, out = run_one_chunk((idx, tl_chunk, slides_subset))
+                except Exception as exc:
+                    self._append_log(
+                        run_meta,
+                        artifact_dir,
+                        "Agent2 chunk failed",
+                        chunk=f"{idx}/{total_chunks}",
+                        error=str(exc),
+                        action="deterministic_fallback",
+                    )
+                    out = self._agent2_chunk_fallback(tl_chunk, slides_subset, idx)
                 partial_kgs.append(out)
                 self._append_log(
                     run_meta,
@@ -1690,9 +1916,9 @@ class MeetingWorkflow:
         else:
             results: dict[int, dict[str, Any]] = {}
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {executor.submit(run_one_chunk, item): item[0] for item in chunk_inputs}
+                futures = {executor.submit(run_one_chunk, item): item for item in chunk_inputs}
                 for future in as_completed(futures):
-                    idx = futures[future]
+                    idx, tl_chunk, slides_subset = futures[future]
                     try:
                         _, out = future.result()
                     except Exception as exc:
@@ -1702,8 +1928,9 @@ class MeetingWorkflow:
                             "Agent2 chunk failed",
                             chunk=f"{idx}/{total_chunks}",
                             error=str(exc),
+                            action="deterministic_fallback",
                         )
-                        raise
+                        out = self._agent2_chunk_fallback(tl_chunk, slides_subset, idx)
                     results[idx] = out
                     self._append_log(
                         run_meta,
@@ -1716,22 +1943,34 @@ class MeetingWorkflow:
                 partial_kgs.append(results[idx])
 
         self._append_log(run_meta, artifact_dir, "Agent2 reduce start", partials=len(partial_kgs))
-        if len(partial_kgs) == 1:
+        if not partial_kgs:
+            kg = self._agent2_deterministic_fallback([], cleaned)
+        elif len(partial_kgs) == 1:
             kg = partial_kgs[0]
         else:
             reduce_user = fill_template(
                 AGENT2_REDUCE_USR,
                 PARTIAL_KGS=json.dumps(partial_kgs, ensure_ascii=False),
             )
-            reduced = self.llm.call(
-                AGENT2_REDUCE_SYS,
-                reduce_user,
-                json_mode=True,
-                required_keys=["entities", "topics"],
-                tag="agent2_reduce",
-            )
-            assert isinstance(reduced, dict)
-            kg = reduced
+            try:
+                reduced = self.llm.call(
+                    AGENT2_REDUCE_SYS,
+                    reduce_user,
+                    json_mode=True,
+                    required_keys=["entities", "topics"],
+                    tag="agent2_reduce",
+                )
+                assert isinstance(reduced, dict)
+                kg = reduced
+            except Exception as exc:
+                self._append_log(
+                    run_meta,
+                    artifact_dir,
+                    "Agent2 reduce failed",
+                    error=str(exc),
+                    action="deterministic_fallback",
+                )
+                kg = self._agent2_deterministic_fallback(partial_kgs, cleaned)
 
         topics = kg.get("topics", []) if isinstance(kg.get("topics"), list) else []
         if not topics:
@@ -1748,7 +1987,18 @@ class MeetingWorkflow:
             raise PipelineError("Agent2 produced no topics (including fallback)")
 
         topic_texts = [build_topic_text(t) for t in topics]
-        topic_vecs = self.llm.embed(topic_texts) if topic_texts else []
+        topic_vecs: list[list[float]] = []
+        if topic_texts:
+            try:
+                topic_vecs = self.llm.embed(topic_texts)
+            except Exception as exc:
+                self._append_log(
+                    run_meta,
+                    artifact_dir,
+                    "Agent2 embedding failed",
+                    error=str(exc),
+                    action="continue_without_vectors",
+                )
         for i, topic in enumerate(topics):
             topic["_vec"] = topic_vecs[i] if i < len(topic_vecs) else []
         self._append_log(
@@ -1782,7 +2032,18 @@ class MeetingWorkflow:
         topics = state["topics"]
 
         agenda_lines = [x.strip() for x in agenda_text.splitlines() if x.strip()]
-        agenda_vecs = self.llm.embed(agenda_lines)
+        agenda_vecs: list[list[float]] = []
+        if agenda_lines:
+            try:
+                agenda_vecs = self.llm.embed(agenda_lines)
+            except Exception as exc:
+                self._append_log(
+                    run_meta,
+                    artifact_dir,
+                    "Agent3A embedding failed",
+                    error=str(exc),
+                    action="continue_without_vectors",
+                )
         semantic_hints = []
         self._append_log(
             run_meta,
@@ -1846,11 +2107,12 @@ class MeetingWorkflow:
 
         timeline_data = state.get("cleaned", {}).get("timeline", [])
 
-        for line, avec in zip(agenda_lines, agenda_vecs):
+        for idx_line, line in enumerate(agenda_lines):
+            avec = agenda_vecs[idx_line] if idx_line < len(agenda_vecs) else []
             scores = []
             for t in topics:
                 vec = t.get("_vec", [])
-                score = cosine(avec, vec) if isinstance(vec, list) else 0.0
+                score = cosine(avec, vec) if (isinstance(avec, list) and isinstance(vec, list) and avec and vec) else 0.0
                 scores.append((score, str(t.get("id", "")), str(t.get("name", "")), str(t.get("description", ""))))
             
             top3 = sorted(scores, key=lambda x: x[0], reverse=True)[:3]
@@ -1887,14 +2149,24 @@ class MeetingWorkflow:
             KG_TOPICS=json.dumps(sanitize_kg_for_output({"topics": topics})["topics"], ensure_ascii=False),
             SEMANTIC_HINTS=json.dumps(semantic_hints, ensure_ascii=False),
         )
-        topic_map = self.llm.call(
-            AGENT3A_SYS,
-            user,
-            json_mode=True,
-            required_keys=["agenda_mapping", "coverage_stats"],
-            tag="agent3a",
-        )
-        assert isinstance(topic_map, dict)
+        try:
+            topic_map = self.llm.call(
+                AGENT3A_SYS,
+                user,
+                json_mode=True,
+                required_keys=["agenda_mapping", "coverage_stats"],
+                tag="agent3a",
+            )
+            assert isinstance(topic_map, dict)
+        except Exception as exc:
+            self._append_log(
+                run_meta,
+                artifact_dir,
+                "Agent3A failed",
+                error=str(exc),
+                action="deterministic_fallback",
+            )
+            topic_map = self._agent3a_fallback_from_hints(agenda_lines, semantic_hints, topics)
         self._append_log(
             run_meta,
             artifact_dir,
@@ -2015,14 +2287,24 @@ class MeetingWorkflow:
             KG=json.dumps(sanitize_kg_for_output(kg), ensure_ascii=False),
             TIMELINE=json.dumps(timeline_sample, ensure_ascii=False),
         )
-        topic_map = self.llm.call(
-            AGENT3B_SYS,
-            user,
-            json_mode=True,
-            required_keys=["extracted_topics", "topic_flow"],
-            tag="agent3b",
-        )
-        assert isinstance(topic_map, dict)
+        try:
+            topic_map = self.llm.call(
+                AGENT3B_SYS,
+                user,
+                json_mode=True,
+                required_keys=["extracted_topics", "topic_flow"],
+                tag="agent3b",
+            )
+            assert isinstance(topic_map, dict)
+        except Exception as exc:
+            self._append_log(
+                run_meta,
+                artifact_dir,
+                "Agent3B failed",
+                error=str(exc),
+                action="fallback_from_kg",
+            )
+            topic_map = self._agent3b_fallback_from_kg(topics)
         extracted = topic_map.get("extracted_topics", [])
         if not isinstance(extracted, list):
             extracted = []
@@ -2399,6 +2681,46 @@ class MeetingWorkflow:
 
         return out
 
+    def _agent4_topic_fallback(self, job: dict[str, Any]) -> dict[str, Any]:
+        idx = int(job.get("idx", 0) or 0)
+        topic_item = job.get("topic_item", {}) if isinstance(job.get("topic_item"), dict) else {}
+        tl_snip = job.get("tl_snip", []) if isinstance(job.get("tl_snip"), list) else []
+        slides_snip = job.get("slides_snip", []) if isinstance(job.get("slides_snip"), list) else []
+        start_hms = str(job.get("start_hms", "00:00:00") or "00:00:00")
+        end_hms = str(job.get("end_hms", "00:00:00") or "00:00:00")
+
+        key_points: list[str] = []
+        for row in tl_snip:
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("text", "") or "").strip()
+            if not text:
+                continue
+            trimmed = text[:180]
+            if trimmed in key_points:
+                continue
+            key_points.append(trimmed)
+            if len(key_points) >= 4:
+                break
+        if not key_points:
+            key_points = ["ไม่พบข้อความสำคัญในช่วงเวลานี้ (fallback)"]
+
+        summary_th = " | ".join(key_points[:2])
+        return {
+            "topic_id": topic_item.get("topic_id", f"T{idx:03d}"),
+            "agenda_number": topic_item.get("agenda_number", str(idx)),
+            "title": topic_item.get("title", ""),
+            "department": topic_item.get("department", ""),
+            "presenter": topic_item.get("key_speaker", ""),
+            "time_range": f"{start_hms} – {end_hms}",
+            "status": topic_item.get("status", "discussed"),
+            "summary_th": summary_th,
+            "key_data_points": key_points,
+            "decisions": [],
+            "action_items": [],
+            "slide_count": len(slides_snip),
+        }
+
     def node_agent4(self, state: WorkflowState) -> WorkflowState:
         run_meta = dict(state["run_meta"])
         artifact_dir = state.get("artifact_dir")
@@ -2552,7 +2874,19 @@ class MeetingWorkflow:
         topic_summaries: list[dict[str, Any]] = []
         if workers == 1:
             for job in topic_jobs:
-                idx, ts = run_one_topic(job)
+                idx = int(job["idx"])
+                try:
+                    _, ts = run_one_topic(job)
+                except Exception as exc:
+                    self._append_log(
+                        run_meta,
+                        artifact_dir,
+                        "Agent4 topic failed",
+                        chunk=f"{idx}/{len(topic_items)}",
+                        error=str(exc),
+                        action="deterministic_fallback",
+                    )
+                    ts = self._agent4_topic_fallback(job)
                 topic_summaries.append(ts)
                 self._append_log(
                     run_meta,
@@ -2565,9 +2899,10 @@ class MeetingWorkflow:
         else:
             results: dict[int, dict[str, Any]] = {}
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {executor.submit(run_one_topic, job): int(job["idx"]) for job in topic_jobs}
+                futures = {executor.submit(run_one_topic, job): job for job in topic_jobs}
                 for future in as_completed(futures):
-                    idx = futures[future]
+                    job = futures[future]
+                    idx = int(job["idx"])
                     try:
                         _, ts = future.result()
                     except Exception as exc:
@@ -2577,8 +2912,9 @@ class MeetingWorkflow:
                             "Agent4 topic failed",
                             chunk=f"{idx}/{len(topic_items)}",
                             error=str(exc),
+                            action="deterministic_fallback",
                         )
-                        raise
+                        ts = self._agent4_topic_fallback(job)
                     results[idx] = ts
                     self._append_log(
                         run_meta,
@@ -2591,20 +2927,52 @@ class MeetingWorkflow:
             for idx in sorted(results):
                 topic_summaries.append(results[idx])
 
+        max_transcript_sec = max(float(s.get("end", 0) or 0) for s in state["segments"])
         self._append_log(run_meta, artifact_dir, "Agent4 executive summary start")
         exec_user = fill_template(
             AGENT4_EXEC_USR,
             TOPIC_SUMMARIES=json.dumps(topic_summaries, ensure_ascii=False),
             KG=json.dumps(sanitize_kg_for_output(kg), ensure_ascii=False),
         )
-        exec_out = self.llm.call(
-            AGENT4_EXEC_SYS,
-            exec_user,
-            json_mode=True,
-            required_keys=["executive_summary_th", "total_decisions", "total_action_items", "meeting_duration"],
-            tag="agent4_exec",
-        )
-        assert isinstance(exec_out, dict)
+        try:
+            exec_out = self.llm.call(
+                AGENT4_EXEC_SYS,
+                exec_user,
+                json_mode=True,
+                required_keys=["executive_summary_th", "total_decisions", "total_action_items", "meeting_duration"],
+                tag="agent4_exec",
+            )
+            assert isinstance(exec_out, dict)
+        except Exception as exc:
+            self._append_log(
+                run_meta,
+                artifact_dir,
+                "Agent4 executive summary failed",
+                error=str(exc),
+                action="deterministic_fallback",
+            )
+            fallback_bullets: list[str] = []
+            for item in topic_summaries:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title", "") or "").strip()
+                summary = str(item.get("summary_th", "") or "").strip()
+                if not (title or summary):
+                    continue
+                line = f"{title}: {summary}" if title else summary
+                fallback_bullets.append(line[:180])
+                if len(fallback_bullets) >= 5:
+                    break
+            fallback_text = "\n".join(f"- {x}" for x in fallback_bullets)
+            exec_out = {
+                "executive_summary_th": (
+                    "สรุปผู้บริหาร (fallback): ระบบใช้ deterministic fallback เพราะ LLM ตอบไม่เข้า schema.\n"
+                    + fallback_text
+                ).strip(),
+                "total_decisions": len(kg.get("entities", {}).get("decisions", [])),
+                "total_action_items": len(kg.get("entities", {}).get("action_items", [])),
+                "meeting_duration": sec_to_hms(max_transcript_sec),
+            }
 
         total_decisions = int(exec_out.get("total_decisions", 0) or 0)
         total_actions = int(exec_out.get("total_action_items", 0) or 0)
@@ -2614,7 +2982,6 @@ class MeetingWorkflow:
         if total_actions <= 0:
             total_actions = len(kg.get("entities", {}).get("action_items", []))
 
-        max_transcript_sec = max(float(s.get("end", 0) or 0) for s in state["segments"])
         summaries = {
             "topic_summaries": topic_summaries,
             "executive_summary_th": str(exec_out.get("executive_summary_th", "")),
@@ -2702,26 +3069,38 @@ class MeetingWorkflow:
             )
             html, html_source = render_fallback_html()
         else:
-            html = self.llm.call(
-                AGENT5_SYS,
-                agent5_user,
-                json_mode=False,
-                required_keys=None,
-                tag="agent5_html",
-            )
-            assert isinstance(html, str)
-            self._append_log(run_meta, artifact_dir, "Agent5 llm done", html_chars=len(html))
-            self._save_html_if_enabled(state, "agent5_raw_llm.html", html)
+            try:
+                html = self.llm.call(
+                    AGENT5_SYS,
+                    agent5_user,
+                    json_mode=False,
+                    required_keys=None,
+                    tag="agent5_html",
+                )
+                assert isinstance(html, str)
+                self._append_log(run_meta, artifact_dir, "Agent5 llm done", html_chars=len(html))
+                self._save_html_if_enabled(state, "agent5_raw_llm.html", html)
 
-            normalized_html = strip_markdown_fences(html)
-            if normalized_html != html:
-                self._append_log(run_meta, artifact_dir, "Agent5 html normalized", stripped_markdown_fence=True)
-            html = normalized_html
+                normalized_html = strip_markdown_fences(html)
+                if normalized_html != html:
+                    self._append_log(run_meta, artifact_dir, "Agent5 html normalized", stripped_markdown_fence=True)
+                html = normalized_html
 
-            compliance_issues = html_compliance_issues(
-                html,
-                expected_topic_sections=len(topic_rows),
-            )
+                compliance_issues = html_compliance_issues(
+                    html,
+                    expected_topic_sections=len(topic_rows),
+                )
+            except Exception as exc:
+                self._append_log(
+                    run_meta,
+                    artifact_dir,
+                    "Agent5 llm failed",
+                    action="fallback_renderer",
+                    error=str(exc),
+                )
+                html, html_source = render_fallback_html()
+                compliance_issues = []
+
             if compliance_issues:
                 self._append_log(
                     run_meta,

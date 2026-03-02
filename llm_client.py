@@ -83,8 +83,9 @@ def parse_json_or_raise(text: str, label: str) -> dict[str, Any]:
             data = json.loads(nested)
     if isinstance(data, list):
         dict_items = [item for item in data if isinstance(item, dict)]
-        if len(dict_items) == 1:
-            data = dict_items[0]
+        if dict_items:
+            # Some models return a list of objects; salvage the most complete object.
+            data = max(dict_items, key=lambda item: len(item.keys()))
     if not isinstance(data, dict):
         raise PipelineError(f"{label}: JSON root must be object")
     return data

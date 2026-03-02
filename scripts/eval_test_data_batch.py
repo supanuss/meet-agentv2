@@ -333,7 +333,29 @@ def run_one_dataset(
             run_status = "failed"
             proc_exit_code = 124
             run_error = f"orchestrator_timeout>{per_run_timeout_sec}s"
-            run_log_path.write_text(run_error, encoding="utf-8")
+            partial_stdout = ""
+            partial_stderr = ""
+            try:
+                partial_stdout = str(getattr(exc, "stdout", "") or "")
+            except Exception:
+                partial_stdout = ""
+            try:
+                partial_stderr = str(getattr(exc, "stderr", "") or "")
+            except Exception:
+                partial_stderr = ""
+            partial_combined = (partial_stdout + "\n" + partial_stderr).strip()
+            if partial_combined:
+                parsed_artifact = parse_artifact_path(partial_combined)
+                if parsed_artifact:
+                    artifact_dir = Path(parsed_artifact)
+                timeout_log = (
+                    f"{run_error}\n"
+                    "--- partial stdout/stderr before timeout ---\n"
+                    f"{partial_combined}\n"
+                )
+                run_log_path.write_text(timeout_log, encoding="utf-8")
+            else:
+                run_log_path.write_text(run_error, encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
             run_status = "failed"
             proc_exit_code = -1

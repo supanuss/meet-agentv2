@@ -24,7 +24,7 @@ Pipeline สร้างรายงานประชุม HTML จาก 3 in
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 cp .env.example .env
 ```
 
